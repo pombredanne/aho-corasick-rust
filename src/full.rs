@@ -1,11 +1,10 @@
 use std::fmt;
-
-use memchr::memchr;
+use std::mem;
 
 use super::{
-    FAIL_STATE, ROOT_STATE,
-    StateIdx, PatIdx,
-    AcAutomaton, Transitions, Match,
+    FAIL_STATE,
+    StateIdx, AcAutomaton, Transitions, Match,
+    usize_bytes, vec_bytes,
 };
 use super::autiter::Automaton;
 
@@ -21,7 +20,7 @@ use super::autiter::Automaton;
 pub struct FullAcAutomaton<P> {
     pats: Vec<P>,
     trans: Vec<StateIdx>,  // row-major, where states are rows
-    out: Vec<Vec<PatIdx>>, // indexed by StateIdx
+    out: Vec<Vec<usize>>, // indexed by StateIdx
     start_bytes: Vec<u8>,
 }
 
@@ -41,13 +40,38 @@ impl<P: AsRef<[u8]>> FullAcAutomaton<P> {
         fac
     }
 
+    #[doc(hidden)]
+    pub fn memory_usage(&self) -> usize {
+        self.pats.iter()
+            .map(|p| vec_bytes() + p.as_ref().len())
+            .fold(0, |a, b| a + b)
+        + (4 * self.trans.len())
+        + self.out.iter()
+              .map(|v| vec_bytes() + (usize_bytes() * v.len()))
+              .fold(0, |a, b| a + b)
+        + self.start_bytes.len()
+    }
+
+    #[doc(hidden)]
+    pub fn heap_bytes(&self) -> usize {
+        self.pats.iter()
+            .map(|p| mem::size_of::<P>() + p.as_ref().len())
+            .fold(0, |a, b| a + b)
+        + (4 * self.trans.len())
+        + self.out.iter()
+              .map(|v| vec_bytes() + (usize_bytes() * v.len()))
+              .fold(0, |a, b| a + b)
+        + self.start_bytes.len()
+    }
+
     fn set(&mut self, si: StateIdx, i: u8, goto: StateIdx) {
         let ns = self.num_states();
         self.trans[i as usize * ns + si as usize] = goto;
     }
 
+    #[doc(hidden)]
     #[inline]
-    fn num_states(&self) -> usize {
+    pub fn num_states(&self) -> usize {
         self.out.len()
     }
 }
@@ -55,7 +79,8 @@ impl<P: AsRef<[u8]>> FullAcAutomaton<P> {
 impl<P: AsRef<[u8]>> Automaton<P> for FullAcAutomaton<P> {
     #[inline]
     fn next_state(&self, si: StateIdx, i: u8) -> StateIdx {
-        self.trans[i as usize * self.num_states() + si as usize]
+        let at = i as usize * self.num_states() + si as usize;
+        unsafe { *self.trans.get_unchecked(at) }
     }
 
     #[inline]
@@ -72,24 +97,12 @@ impl<P: AsRef<[u8]>> Automaton<P> for FullAcAutomaton<P> {
 
     #[inline]
     fn has_match(&self, si: StateIdx, outi: usize) -> bool {
-        outi < self.out[si as usize].len()
+        unsafe { outi < self.out.get_unchecked(si as usize).len() }
     }
 
     #[inline]
-    fn skip_to(&self, si: StateIdx, text: &[u8], at: usize) -> usize {
-        if si != ROOT_STATE || !self.is_skippable() {
-            return at;
-        }
-        let b = self.start_bytes[0];
-        match memchr(b, &text[at..]) {
-            None => text.len(),
-            Some(i) => at + i,
-        }
-    }
-
-    #[inline]
-    fn is_skippable(&self) -> bool {
-        self.start_bytes.len() == 1
+    fn start_bytes(&self) -> &[u8] {
+        &self.start_bytes
     }
 
     #[inline]

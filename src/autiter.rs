@@ -1,7 +1,9 @@
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead};
 use std::marker::PhantomData;
 
-use super::{ROOT_STATE, PatIdx, StateIdx};
+use memchr::{memchr, memchr2, memchr3};
+
+use super::{ROOT_STATE, StateIdx};
 
 /// An abstraction over automatons and their corresponding iterators.
 /// The type parameter `P` is the type of the pattern that was used to
@@ -12,22 +14,13 @@ pub trait Automaton<P> {
 
     /// Return true if and only if the given state and current pattern index
     /// indicate a match.
-    fn has_match(&self, si: StateIdx, outi: PatIdx) -> bool;
+    fn has_match(&self, si: StateIdx, outi: usize) -> bool;
 
     /// Build a match given the current state, pattern index and input index.
-    fn get_match(&self, si: StateIdx, outi: PatIdx, texti: usize) -> Match;
+    fn get_match(&self, si: StateIdx, outi: usize, texti: usize) -> Match;
 
-    /// Attempt to skip through the input.
-    ///
-    /// This returns the index into `text` at which the next match attempt
-    /// should start. (If no skipping occurred, then the return value should
-    /// be equal to `at`.)
-    ///
-    /// Finally, if no match is possible, then return `text.len()`.
-    fn skip_to(&self, si: StateIdx, text: &[u8], at: usize) -> usize;
-
-    /// Returns true if and only if this automaton can skip through the input.
-    fn is_skippable(&self) -> bool;
+    /// Return the set of bytes that have transitions in the root state.
+    fn start_bytes(&self) -> &[u8];
 
     /// Returns all of the patterns matched by this automaton.
     ///
@@ -115,14 +108,29 @@ pub trait Automaton<P> {
     }
 }
 
-impl<'a, P: AsRef<[u8]>, A: 'a + Automaton<P> + ?Sized> Automaton<P> for &'a A {
-    fn next_state(&self, si: StateIdx, b: u8) -> StateIdx { (**self).next_state(si, b) }
-    fn has_match(&self, si: StateIdx, outi: PatIdx) -> bool { (**self).has_match(si, outi) }
-    fn skip_to(&self, si: StateIdx, text: &[u8], at: usize) -> usize { (**self).skip_to(si, text, at) }
-    fn is_skippable(&self) -> bool { (**self).is_skippable() }
-    fn patterns(&self) -> &[P] { (**self).patterns() }
-    fn pattern(&self, i: usize) -> &P { (**self).pattern(i) }
-    fn get_match(&self, si: StateIdx, outi: PatIdx, texti: usize) -> Match {
+impl<'a, P: AsRef<[u8]>, A: 'a + Automaton<P> + ?Sized>
+        Automaton<P> for &'a A {
+    fn next_state(&self, si: StateIdx, b: u8) -> StateIdx {
+        (**self).next_state(si, b)
+    }
+
+    fn has_match(&self, si: StateIdx, outi: usize) -> bool {
+        (**self).has_match(si, outi)
+    }
+
+    fn start_bytes(&self) -> &[u8] {
+        (**self).start_bytes()
+    }
+
+    fn patterns(&self) -> &[P] {
+        (**self).patterns()
+    }
+
+    fn pattern(&self, i: usize) -> &P {
+        (**self).pattern(i)
+    }
+
+    fn get_match(&self, si: StateIdx, outi: usize, texti: usize) -> Match {
         (**self).get_match(si, outi, texti)
     }
 }
@@ -168,6 +176,7 @@ pub struct Matches<'a, 's, P, A: 'a + Automaton<P> + ?Sized> {
 //
 // `step_to_match` is the version of the inner loop without skipping,
 // and `skip_to_match` is the version with skipping.
+#[inline(never)]
 fn step_to_match<P, A: Automaton<P> + ?Sized>(
     aut: &A,
     text: &[u8],
@@ -180,39 +189,136 @@ fn step_to_match<P, A: Automaton<P> + ?Sized>(
             return Some((texti, si));
         }
         texti += 1;
+        if texti + 4 < text.len() {
+            si = aut.next_state(si, text[texti]);
+            if aut.has_match(si, 0) {
+                return Some((texti, si));
+            }
+            texti += 1;
+            si = aut.next_state(si, text[texti]);
+            if aut.has_match(si, 0) {
+                return Some((texti, si));
+            }
+            texti += 1;
+            si = aut.next_state(si, text[texti]);
+            if aut.has_match(si, 0) {
+                return Some((texti, si));
+            }
+            texti += 1;
+            si = aut.next_state(si, text[texti]);
+            if aut.has_match(si, 0) {
+                return Some((texti, si));
+            }
+            texti += 1;
+            si = aut.next_state(si, text[texti]);
+            if aut.has_match(si, 0) {
+                return Some((texti, si));
+            }
+            texti += 1;
+        }
     }
     None
 }
 
-fn skip_to_match<P, A: Automaton<P> + ?Sized>(
+fn skip_to_match<P, A: Automaton<P> + ?Sized, F: Fn(&A, &[u8], usize) -> usize>(
     aut: &A,
     text: &[u8],
     mut texti: usize,
-    mut si: StateIdx
+    mut si: StateIdx,
+    skip: F,
 ) -> Option<(usize, StateIdx)> {
-    texti = aut.skip_to(si, text, texti);
+    if si == ROOT_STATE {
+        texti = skip(aut, text, texti);
+    }
     while texti < text.len() {
         si = aut.next_state(si, text[texti]);
         if aut.has_match(si, 0) {
             return Some((texti, si));
         }
-        texti = aut.skip_to(si, text, texti + 1);
+        if si == ROOT_STATE {
+            texti = skip(aut, text, texti + 1);
+        } else {
+            texti += 1;
+        }
     }
     None
+}
+
+#[inline]
+fn skip1<P, A: Automaton<P> + ?Sized>(
+    aut: &A,
+    text: &[u8],
+    at: usize,
+) -> usize {
+    debug_assert!(aut.start_bytes().len() == 1);
+    let b = aut.start_bytes()[0];
+    match memchr(b, &text[at..]) {
+        None => text.len(),
+        Some(i) => at + i,
+    }
+}
+
+#[inline]
+fn skip2<P, A: Automaton<P> + ?Sized>(
+    aut: &A,
+    text: &[u8],
+    at: usize,
+) -> usize {
+    debug_assert!(aut.start_bytes().len() == 2);
+    let (b1, b2) = (aut.start_bytes()[0], aut.start_bytes()[1]);
+    match memchr2(b1, b2, &text[at..]) {
+        None => text.len(),
+        Some(i) => at + i,
+    }
+}
+
+#[inline]
+fn skip3<P, A: Automaton<P> + ?Sized>(
+    aut: &A,
+    text: &[u8],
+    at: usize,
+) -> usize {
+    debug_assert!(aut.start_bytes().len() == 3);
+    let (b1, b2, b3) = (
+        aut.start_bytes()[0], aut.start_bytes()[1], aut.start_bytes()[2],
+    );
+    match memchr3(b1, b2, b3, &text[at..]) {
+        None => text.len(),
+        Some(i) => at + i,
+    }
 }
 
 impl<'a, 's, P, A: Automaton<P> + ?Sized> Iterator for Matches<'a, 's, P, A> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Match> {
-        if self.aut.is_skippable() {
-            if let Some((texti, si)) = skip_to_match(self.aut, self.text, self.texti, self.si) {
+        if self.aut.start_bytes().len() == 1 {
+            let skip = skip_to_match(
+                self.aut, self.text, self.texti, self.si, skip1);
+            if let Some((texti, si)) = skip {
+                self.texti = texti + 1;
+                self.si = ROOT_STATE;
+                return Some(self.aut.get_match(si, 0, texti));
+            }
+        } else if self.aut.start_bytes().len() == 2 {
+            let skip = skip_to_match(
+                self.aut, self.text, self.texti, self.si, skip2);
+            if let Some((texti, si)) = skip {
+                self.texti = texti + 1;
+                self.si = ROOT_STATE;
+                return Some(self.aut.get_match(si, 0, texti));
+            }
+        } else if self.aut.start_bytes().len() == 3 {
+            let skip = skip_to_match(
+                self.aut, self.text, self.texti, self.si, skip3);
+            if let Some((texti, si)) = skip {
                 self.texti = texti + 1;
                 self.si = ROOT_STATE;
                 return Some(self.aut.get_match(si, 0, texti));
             }
         } else {
-            if let Some((texti, si)) = step_to_match(self.aut, self.text, self.texti, self.si) {
+            let step = step_to_match(self.aut, self.text, self.texti, self.si);
+            if let Some((texti, si)) = step {
                 self.texti = texti + 1;
                 self.si = ROOT_STATE;
                 return Some(self.aut.get_match(si, 0, texti));
@@ -237,7 +343,8 @@ pub struct StreamMatches<'a, R, P, A: 'a + Automaton<P> + ?Sized> {
     _m: PhantomData<P>,
 }
 
-impl<'a, R: io::Read, P, A: Automaton<P>> Iterator for StreamMatches<'a, R, P, A> {
+impl<'a, R: io::Read, P, A: Automaton<P>>
+        Iterator for StreamMatches<'a, R, P, A> {
     type Item = io::Result<Match>;
 
     fn next(&mut self) -> Option<io::Result<Match>> {
@@ -284,7 +391,8 @@ pub struct MatchesOverlapping<'a, 's, P, A: 'a + Automaton<P> + ?Sized> {
     _m: PhantomData<P>,
 }
 
-impl<'a, 's, P, A: Automaton<P> + ?Sized> Iterator for MatchesOverlapping<'a, 's, P, A> {
+impl<'a, 's, P, A: Automaton<P> + ?Sized>
+        Iterator for MatchesOverlapping<'a, 's, P, A> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Match> {
@@ -298,14 +406,33 @@ impl<'a, 's, P, A: Automaton<P> + ?Sized> Iterator for MatchesOverlapping<'a, 's
         }
 
         self.outi = 0;
-        if self.aut.is_skippable() {
-            if let Some((texti, si)) = skip_to_match(self.aut, self.text, self.texti, self.si) {
+        if self.aut.start_bytes().len() == 1 {
+            let skip = skip_to_match(
+                self.aut, self.text, self.texti, self.si, skip1);
+            if let Some((texti, si)) = skip {
+                self.texti = texti;
+                self.si = si;
+                return self.next();
+            }
+        } else if self.aut.start_bytes().len() == 2 {
+            let skip = skip_to_match(
+                self.aut, self.text, self.texti, self.si, skip2);
+            if let Some((texti, si)) = skip {
+                self.texti = texti;
+                self.si = si;
+                return self.next();
+            }
+        } else if self.aut.start_bytes().len() == 3 {
+            let skip = skip_to_match(
+                self.aut, self.text, self.texti, self.si, skip3);
+            if let Some((texti, si)) = skip {
                 self.texti = texti;
                 self.si = si;
                 return self.next();
             }
         } else {
-            if let Some((texti, si)) = step_to_match(self.aut, self.text, self.texti, self.si) {
+            let step = step_to_match(self.aut, self.text, self.texti, self.si);
+            if let Some((texti, si)) = step {
                 self.texti = texti;
                 self.si = si;
                 return self.next();
@@ -331,12 +458,8 @@ pub struct StreamMatchesOverlapping<'a, R, P, A: 'a + Automaton<P> + ?Sized> {
     _m: PhantomData<P>,
 }
 
-impl<
-    'a,
-    R: io::Read,
-    P,
-    A: Automaton<P> + ?Sized,
-> Iterator for StreamMatchesOverlapping<'a, R, P, A> {
+impl<'a, R: io::Read, P, A: Automaton<P> + ?Sized>
+        Iterator for StreamMatchesOverlapping<'a, R, P, A> {
     type Item = io::Result<Match>;
 
     fn next(&mut self) -> Option<io::Result<Match>> {
@@ -362,8 +485,8 @@ impl<
             for (i, &b) in bs.iter().enumerate() {
                 self.si = self.aut.next_state(self.si, b);
                 if self.aut.has_match(self.si, self.outi) {
-                    m = Some(Ok(self.aut.get_match(self.si, self.outi,
-                                                   self.texti)));
+                    m = Some(Ok(self.aut.get_match(
+                        self.si, self.outi, self.texti)));
                     consumed = i + 1;
                     self.outi += 1;
                     if !self.aut.has_match(self.si, self.outi) {

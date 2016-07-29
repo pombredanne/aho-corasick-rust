@@ -118,7 +118,6 @@ assert_eq!(matches, vec![Match { pati: 1, start: 0, end: 1}]);
 ```
 */
 
-#![allow(deprecated)] // for connect -> join
 #![deny(missing_docs)]
 
 extern crate memchr;
@@ -128,8 +127,7 @@ extern crate memchr;
 use std::collections::VecDeque;
 use std::fmt;
 use std::iter::FromIterator;
-
-use memchr::memchr;
+use std::mem;
 
 pub use self::autiter::{
     Automaton, Match,
@@ -151,14 +149,12 @@ mod full;
 /// when using the `Sparse` transition representation.
 pub type StateIdx = u32;
 
-type PatIdx = usize;
-
 // Constants for special state indexes.
 const FAIL_STATE: u32 = 0;
 const ROOT_STATE: u32 = 1;
 
-// Limit the depth at which we use a dense alphabet map. Once the limit is
-// reached, a sparse set is used (and lookup becomes O(n)).
+// Limit the depth at which we use a sparse alphabet map. Once the limit is
+// reached, a dense set is used (and lookup becomes O(n)).
 //
 // This does have a performance hit, but the (straight forward) alternative
 // is to have a `256 * 4` byte overhead for every state.
@@ -167,19 +163,20 @@ const ROOT_STATE: u32 = 1;
 //
 // This limit should only be increased at your peril. Namely, in the worst
 // case, `256^DENSE_DEPTH_THRESHOLD * 4` corresponds to the memory usage in
-// bytes. A value of `3` gives us a solid cap at around 64MB, which works
-// well in practice even for dictionary sized automatons.
+// bytes. A value of `1` gives us a good balance. This is also a happy point
+// in the benchmarks. A value of `0` gives considerably worse times on certain
+// benchmarks (e.g., `ac_ten_one_prefix_byte_every_match`) than even a value
+// of `1`. A value of `2` is slightly better than `1` and it looks like gains
+// level off at that point with not much observable difference when set to
+// `3`.
 //
 // Why not make this user configurable? Well, it doesn't make much sense
 // because we pay for it with case analysis in the matching loop. Increasing it
 // doesn't have much impact on performance (outside of pathological cases?).
 //
-// There is probably room for adding a new automaton type that doesn't have
-// this restriction.
-//
 // N.B. Someone else seems to have discovered an alternative, but I haven't
 // grokked it yet: https://github.com/mischasan/aho-corasick
-const DENSE_DEPTH_THRESHOLD: u32 = 3;
+const DENSE_DEPTH_THRESHOLD: u32 = 1;
 
 /// An Aho-Corasick finite automaton.
 ///
@@ -194,7 +191,7 @@ pub struct AcAutomaton<P, T=Dense> {
 
 #[derive(Clone)]
 struct State<T> {
-    out: Vec<PatIdx>,
+    out: Vec<usize>,
     fail: StateIdx,
     goto: T,
     depth: u32,
@@ -234,6 +231,22 @@ impl<P: AsRef<[u8]>, T: Transitions> AcAutomaton<P, T> {
     pub fn into_full(self) -> FullAcAutomaton<P> {
         FullAcAutomaton::new(self)
     }
+
+    #[doc(hidden)]
+    pub fn num_states(&self) -> usize {
+        self.states.len()
+    }
+
+    #[doc(hidden)]
+    pub fn heap_bytes(&self) -> usize {
+        self.pats.iter()
+            .map(|p| mem::size_of::<P>() + p.as_ref().len())
+            .fold(0, |a, b| a + b)
+        + self.states.iter()
+              .map(|s| mem::size_of::<State<T>>() + s.heap_bytes())
+              .fold(0, |a, b| a + b)
+        + self.start_bytes.len()
+    }
 }
 
 impl<P: AsRef<[u8]>, T: Transitions> Automaton<P> for AcAutomaton<P, T> {
@@ -269,20 +282,8 @@ impl<P: AsRef<[u8]>, T: Transitions> Automaton<P> for AcAutomaton<P, T> {
     }
 
     #[inline]
-    fn skip_to(&self, si: StateIdx, text: &[u8], at: usize) -> usize {
-        if si != ROOT_STATE || !self.is_skippable() {
-            return at;
-        }
-        let b = self.start_bytes[0];
-        match memchr(b, &text[at..]) {
-            None => text.len(),
-            Some(i) => at + i,
-        }
-    }
-
-    #[inline]
-    fn is_skippable(&self) -> bool {
-        self.start_bytes.len() == 1
+    fn start_bytes(&self) -> &[u8] {
+        &self.start_bytes
     }
 
     #[inline]
@@ -378,8 +379,18 @@ impl<T: Transitions> State<T> {
         }
     }
 
-    fn goto(&self, b: u8) -> StateIdx { self.goto.goto(b) }
-    fn set_goto(&mut self, b: u8, si: StateIdx) { self.goto.set_goto(b, si); }
+    fn goto(&self, b: u8) -> StateIdx {
+        self.goto.goto(b)
+    }
+
+    fn set_goto(&mut self, b: u8, si: StateIdx) {
+        self.goto.set_goto(b, si);
+    }
+
+    fn heap_bytes(&self) -> usize {
+        (self.out.len() * usize_bytes())
+        + self.goto.heap_bytes()
+    }
 }
 
 /// An abstraction over state transition strategies.
@@ -396,6 +407,8 @@ pub trait Transitions {
     fn goto(&self, alpha: u8) -> StateIdx;
     /// Set the next state index for the character given.
     fn set_goto(&mut self, alpha: u8, si: StateIdx);
+    /// The memory use in bytes (on the heap) of this set of transitions.
+    fn heap_bytes(&self) -> usize;
 }
 
 /// State transitions that can be stored either sparsely or densely.
@@ -439,6 +452,13 @@ impl Transitions for Dense {
             DenseChoice::Dense(ref mut m) => m.push((b, si)),
         }
     }
+
+    fn heap_bytes(&self) -> usize {
+        match self.0 {
+            DenseChoice::Sparse(ref m) => m.len() * 4,
+            DenseChoice::Dense(ref m) => m.len() * (1 + 4),
+        }
+    }
 }
 
 /// State transitions that are always sparse.
@@ -461,6 +481,10 @@ impl Transitions for Sparse {
     fn set_goto(&mut self, b: u8, si: StateIdx) {
         self.0[b as usize] = si;
     }
+
+    fn heap_bytes(&self) -> usize {
+        self.0.len() * 4
+    }
 }
 
 impl<S: AsRef<[u8]>> FromIterator<S> for AcAutomaton<S> {
@@ -473,7 +497,8 @@ impl<S: AsRef<[u8]>> FromIterator<S> for AcAutomaton<S> {
 // Provide some question debug impls for viewing automatons.
 // The custom impls mostly exist for special showing of sparse maps.
 
-impl<P: AsRef<[u8]> + fmt::Debug, T: Transitions> fmt::Debug for AcAutomaton<P, T> {
+impl<P: AsRef<[u8]> + fmt::Debug, T: Transitions>
+        fmt::Debug for AcAutomaton<P, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use std::iter::repeat;
 
@@ -503,7 +528,7 @@ impl<T: Transitions> State<T> {
             }
             goto.push(format!("{} => {}", from_u32(b as u32).unwrap(), si));
         }
-        goto.connect(", ")
+        goto.join(", ")
     }
 }
 
@@ -528,7 +553,7 @@ digraph automaton {{
     labelloc="l";
     labeljust="l";
     rankdir="LR";
-"#, self.pats.connect(", "));
+"#, self.pats.join(", "));
         for (i, s) in self.states.iter().enumerate().skip(1) {
             let i = i as u32;
             if s.out.len() == 0 {
@@ -548,6 +573,15 @@ digraph automaton {{
         w!(out, "}}");
         out
     }
+}
+
+fn vec_bytes() -> usize {
+    usize_bytes() * 3
+}
+
+fn usize_bytes() -> usize {
+    let bits = usize::max_value().count_ones() as usize;
+    bits / 8
 }
 
 #[cfg(test)]
